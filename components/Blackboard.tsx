@@ -1,5 +1,18 @@
 import React, { useRef, useEffect, useState, useCallback, useImperativeHandle, forwardRef } from 'react';
-import { Stroke, Point, ToolType, StrokeType, Theme, BlackboardRef } from '../types';
+import { Stroke, Point, ToolType, StrokeType, Theme, BlackboardRef, ResizeHandle } from '../types';
+import { useHistory } from '../hooks/useHistory';
+import { 
+  getStrokeBounds, 
+  getSelectionBoxBounds, 
+  checkIntersection50Percent, 
+  hitTestStroke, 
+  normalizePoints,
+  hitTestHandles,
+  getCenter,
+  rotatePoint,
+  getUnrotatedBounds
+} from '../utils/geometry';
+import { renderStroke, renderSelectionBox, clearCanvas } from '../utils/renderer';
 
 interface BlackboardProps {
   tool: ToolType;
@@ -8,12 +21,38 @@ interface BlackboardProps {
   onHistoryChange: (canUndo: boolean, canRedo: boolean) => void;
 }
 
-interface BoundingBox {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
+// Helper to determine cursor based on rotation and handle type
+const getCursorForHandle = (handle: ResizeHandle | null, rotation: number): string => {
+  if (!handle) return 'default';
+  if (handle === 'rot') return 'grab';
+
+  let angle = 0;
+  switch (handle) {
+    case 'n': angle = 0; break;
+    case 'ne': angle = 45; break;
+    case 'e': angle = 90; break;
+    case 'se': angle = 135; break;
+    case 's': angle = 180; break;
+    case 'sw': angle = 225; break;
+    case 'w': angle = 270; break;
+    case 'nw': angle = 315; break;
+  }
+
+  // Add object rotation (convert radians to degrees)
+  angle += (rotation * 180 / Math.PI);
+  
+  // Normalize to 0-360
+  angle = (angle % 360 + 360) % 360;
+
+  if (angle < 22.5 || angle >= 337.5) return 'ns-resize';
+  if (angle < 67.5) return 'nesw-resize';
+  if (angle < 112.5) return 'ew-resize';
+  if (angle < 157.5) return 'nwse-resize';
+  if (angle < 202.5) return 'ns-resize';
+  if (angle < 247.5) return 'nesw-resize';
+  if (angle < 292.5) return 'ew-resize';
+  return 'nwse-resize';
+};
 
 export const Blackboard = forwardRef<BlackboardRef, BlackboardProps>(({ 
   tool, 
@@ -24,40 +63,44 @@ export const Blackboard = forwardRef<BlackboardRef, BlackboardProps>(({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   
-  // State
-  const [history, setHistory] = useState<Stroke[][]>([[]]);
-  const [historyIndex, setHistoryIndex] = useState(0);
-  const strokes = history[historyIndex] || [];
-  
+  // Logic Hooks
+  const { 
+    strokes, 
+    pushToHistory, 
+    updateCurrentHistory, 
+    undo, 
+    redo, 
+    clear, 
+    canUndo, 
+    canRedo 
+  } = useHistory();
+
+  // Local Interaction State
   const [currentStroke, setCurrentStroke] = useState<Partial<Stroke> | null>(null);
   const [isDrawing, setIsDrawing] = useState(false);
-  
-  // Selection State
   const [selectedStrokeIds, setSelectedStrokeIds] = useState<Set<string>>(new Set());
   const [selectionBox, setSelectionBox] = useState<{start: Point, current: Point} | null>(null);
+  const [cursor, setCursor] = useState('default');
   
-  // Dragging State
-  const [dragStartPos, setDragStartPos] = useState<Point | null>(null);
-  const [isDraggingObjects, setIsDraggingObjects] = useState(false);
+  // Transform State
+  const [interactionState, setInteractionState] = useState<{
+    type: 'drag' | 'resize' | 'rotate' | 'idle',
+    handle?: ResizeHandle,
+    startPos: Point,
+    initialStrokes: Stroke[] // Snapshot for diffing
+  }>({ type: 'idle', startPos: {x:0, y:0}, initialStrokes: [] });
 
-  // Helper: Save state to history
-  const pushToHistory = (newStrokes: Stroke[]) => {
-    const newHistory = history.slice(0, historyIndex + 1);
-    newHistory.push(newStrokes);
-    if (newHistory.length > 50) newHistory.shift();
-    setHistory(newHistory);
-    setHistoryIndex(newHistory.length - 1);
-  };
+  // Sync History state with parent
+  useEffect(() => {
+    onHistoryChange(canUndo, canRedo);
+  }, [canUndo, canRedo, onHistoryChange]);
 
+  // Expose API
   useImperativeHandle(ref, () => ({
-    undo: () => {
-      if (historyIndex > 0) setHistoryIndex(prev => prev - 1);
-    },
-    redo: () => {
-      if (historyIndex < history.length - 1) setHistoryIndex(prev => prev + 1);
-    },
+    undo,
+    redo,
     clear: () => {
-      pushToHistory([]);
+      clear();
       setSelectedStrokeIds(new Set());
     },
     deleteSelected: () => {
@@ -81,10 +124,7 @@ export const Blackboard = forwardRef<BlackboardRef, BlackboardProps>(({
     }
   }));
 
-  useEffect(() => {
-    onHistoryChange(historyIndex > 0, historyIndex < history.length - 1);
-  }, [historyIndex, history.length, onHistoryChange]);
-
+  // Helper: Get Coordinates
   const getCoordinates = (event: React.MouseEvent | React.TouchEvent): Point | null => {
     const canvas = canvasRef.current;
     if (!canvas) return null;
@@ -102,194 +142,17 @@ export const Blackboard = forwardRef<BlackboardRef, BlackboardProps>(({
     return { x: clientX - rect.left, y: clientY - rect.top };
   };
 
-  const getRenderColor = (colorHex: string) => {
-    if (theme === 'light' && colorHex.toLowerCase() === '#ffffff') return '#000000';
-    return colorHex;
-  };
-
-  // --- Geometry Helpers ---
-
-  const distanceToSegment = (p: Point, v: Point, w: Point) => {
-    const l2 = (w.x - v.x) ** 2 + (w.y - v.y) ** 2;
-    if (l2 === 0) return Math.hypot(p.x - v.x, p.y - v.y);
-    let t = ((p.x - v.x) * (w.x - v.x) + (p.y - v.y) * (w.y - v.y)) / l2;
-    t = Math.max(0, Math.min(1, t));
-    return Math.hypot(p.x - (v.x + t * (w.x - v.x)), p.y - (v.y + t * (w.y - v.y)));
-  };
-
-  // Get Bounding Box of a stroke in absolute coordinates
-  const getStrokeBounds = (stroke: Stroke): BoundingBox => {
-    const { position, points, type } = stroke;
-    // Calculate relative bounds first
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-
-    if (type === 'circle' && points.length >= 2) {
-      // Circle logic: points[0] is start (corner), points[1] is end (corner of bounding box)
-      // Actually in renderStroke for circle: center is mid of start/end, radii are half dists
-      // The drawing logic defines a box from start to end.
-      const start = points[0];
-      const end = points[1];
-      const left = Math.min(start.x, end.x);
-      const right = Math.max(start.x, end.x);
-      const top = Math.min(start.y, end.y);
-      const bottom = Math.max(start.y, end.y);
-      
-      minX = left; maxX = right; minY = top; maxY = bottom;
-    } else {
-      // Freehand, Rect, Arrow
-      points.forEach(p => {
-        if (p.x < minX) minX = p.x;
-        if (p.x > maxX) maxX = p.x;
-        if (p.y < minY) minY = p.y;
-        if (p.y > maxY) maxY = p.y;
-      });
-    }
-
-    // Add position offset to get absolute bounds
-    return {
-      x: minX + position.x,
-      y: minY + position.y,
-      width: maxX - minX,
-      height: maxY - minY
-    };
-  };
-
-  const getSelectionBoxBounds = (box: {start: Point, current: Point}): BoundingBox => {
-    return {
-      x: Math.min(box.start.x, box.current.x),
-      y: Math.min(box.start.y, box.current.y),
-      width: Math.abs(box.current.x - box.start.x),
-      height: Math.abs(box.current.y - box.start.y)
-    };
-  };
-
-  const checkIntersection50Percent = (selection: BoundingBox, stroke: BoundingBox): boolean => {
-    // Intersection Rectangle
-    const xOverlap = Math.max(0, Math.min(selection.x + selection.width, stroke.x + stroke.width) - Math.max(selection.x, stroke.x));
-    const yOverlap = Math.max(0, Math.min(selection.y + selection.height, stroke.y + stroke.height) - Math.max(selection.y, stroke.y));
-    
-    const intersectionArea = xOverlap * yOverlap;
-    const strokeArea = stroke.width * stroke.height;
-
-    if (strokeArea === 0) return false; // Avoid division by zero for dots
-    
-    return (intersectionArea / strokeArea) >= 0.5;
-  };
-
-  const hitTestStroke = useCallback((stroke: Stroke, p: Point, threshold: number = 10): boolean => {
-    const { position, points, type } = stroke;
-    const absPoints = points.map(pt => ({ x: pt.x + position.x, y: pt.y + position.y }));
-
-    if (type === 'freehand') {
-      for (let i = 0; i < absPoints.length - 1; i++) {
-        if (distanceToSegment(p, absPoints[i], absPoints[i+1]) < threshold) return true;
-      }
-      return false;
-    } else if (type === 'rect') {
-      const [start, end] = absPoints;
-      const tl = { x: Math.min(start.x, end.x), y: Math.min(start.y, end.y) };
-      const br = { x: Math.max(start.x, end.x), y: Math.max(start.y, end.y) };
-      const tr = { x: br.x, y: tl.y };
-      const bl = { x: tl.x, y: br.y };
-      
-      return (
-        distanceToSegment(p, tl, tr) < threshold ||
-        distanceToSegment(p, tr, br) < threshold ||
-        distanceToSegment(p, br, bl) < threshold ||
-        distanceToSegment(p, bl, tl) < threshold
-      );
-    } else if (type === 'circle') {
-      if (absPoints.length < 2) return false;
-      const [start, end] = absPoints;
-      const centerX = (start.x + end.x) / 2;
-      const centerY = (start.y + end.y) / 2;
-      const rx = Math.abs(end.x - start.x) / 2;
-      const ry = Math.abs(end.y - start.y) / 2;
-
-      if (rx < threshold && ry < threshold) return Math.hypot(p.x - centerX, p.y - centerY) < threshold * 2;
-      
-      const dx = p.x - centerX;
-      const dy = p.y - centerY;
-      const outerRx = rx + threshold; const outerRy = ry + threshold;
-      const innerRx = Math.max(0, rx - threshold); const innerRy = Math.max(0, ry - threshold);
-      const inOuter = (dx * dx) / (outerRx * outerRx) + (dy * dy) / (outerRy * outerRy) <= 1;
-      let inInner = false;
-      if (innerRx > 0 && innerRy > 0) inInner = (dx * dx) / (innerRx * innerRx) + (dy * dy) / (innerRy * innerRy) <= 1;
-      return inOuter && !inInner;
-    } else if (type === 'arrow') {
-      const [start, end] = absPoints;
-      return distanceToSegment(p, start, end) < threshold;
-    }
-    return false;
-  }, []);
-
-  // --- Rendering ---
-  const renderStroke = useCallback((ctx: CanvasRenderingContext2D, stroke: Stroke) => {
-    ctx.beginPath();
-    ctx.strokeStyle = getRenderColor(stroke.color);
-    ctx.lineWidth = stroke.width;
-    
-    // Highlight if selected
-    if (selectedStrokeIds.has(stroke.id) && tool === 'select') {
-      ctx.shadowColor = theme === 'dark' ? '#3b82f6' : '#2563eb'; // Blue glow
-      ctx.shadowBlur = 10;
-      ctx.strokeStyle = theme === 'dark' ? '#60a5fa' : '#3b82f6'; // Lighter blue stroke when selected
-    } else {
-      ctx.shadowBlur = 0;
-    }
-
-    const { x: ox, y: oy } = stroke.position;
-    const pts = stroke.points;
-
-    if (stroke.type === 'freehand') {
-      if (pts.length < 2) return;
-      ctx.moveTo(pts[0].x + ox, pts[0].y + oy);
-      for (let i = 1; i < pts.length; i++) {
-        ctx.lineTo(pts[i].x + ox, pts[i].y + oy);
-      }
-    } else if (stroke.type === 'rect') {
-      if (pts.length < 2) return;
-      const start = { x: pts[0].x + ox, y: pts[0].y + oy };
-      const end = { x: pts[1].x + ox, y: pts[1].y + oy };
-      ctx.rect(start.x, start.y, end.x - start.x, end.y - start.y);
-    } else if (stroke.type === 'circle') {
-      if (pts.length < 2) return;
-      const start = { x: pts[0].x + ox, y: pts[0].y + oy };
-      const end = { x: pts[1].x + ox, y: pts[1].y + oy };
-      const centerX = (start.x + end.x) / 2;
-      const centerY = (start.y + end.y) / 2;
-      const radiusX = Math.abs(end.x - start.x) / 2;
-      const radiusY = Math.abs(end.y - start.y) / 2;
-      ctx.ellipse(centerX, centerY, radiusX, radiusY, 0, 0, 2 * Math.PI);
-    } else if (stroke.type === 'arrow') {
-      if (pts.length < 2) return;
-      const start = { x: pts[0].x + ox, y: pts[0].y + oy };
-      const end = { x: pts[1].x + ox, y: pts[1].y + oy };
-      ctx.moveTo(start.x, start.y);
-      ctx.lineTo(end.x, end.y);
-      const headLength = 20;
-      const angle = Math.atan2(end.y - start.y, end.x - start.x);
-      ctx.lineTo(end.x - headLength * Math.cos(angle - Math.PI / 6), end.y - headLength * Math.sin(angle - Math.PI / 6));
-      ctx.moveTo(end.x, end.y);
-      ctx.lineTo(end.x - headLength * Math.cos(angle + Math.PI / 6), end.y - headLength * Math.sin(angle + Math.PI / 6));
-    }
-    
-    ctx.stroke();
-    ctx.shadowBlur = 0; // Reset
-  }, [selectedStrokeIds, tool, theme]);
-
+  // --- Rendering Loop ---
   const render = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
+    clearCanvas(ctx, canvas.width, canvas.height);
 
     // Draw History Strokes
-    strokes.forEach(s => renderStroke(ctx, s));
+    strokes.forEach(s => renderStroke(ctx, s, theme, tool, selectedStrokeIds.has(s.id)));
 
     // Draw Current Active Drawing
     if (currentStroke && currentStroke.points && currentStroke.points.length > 0) {
@@ -300,25 +163,17 @@ export const Blackboard = forwardRef<BlackboardRef, BlackboardProps>(({
         color: currentStroke.color || color,
         width: currentStroke.width || 4,
         position: { x: 0, y: 0 },
+        rotation: 0
       };
-      renderStroke(ctx, tempStroke);
+      renderStroke(ctx, tempStroke, theme, tool, false);
     }
 
-    // Draw Selection Box
+    // Draw Selection Box (only when selecting multiple or empty space)
     if (selectionBox) {
-      const bounds = getSelectionBoxBounds(selectionBox);
-      ctx.save();
-      ctx.strokeStyle = '#3b82f6';
-      ctx.lineWidth = 1;
-      ctx.fillStyle = 'rgba(59, 130, 246, 0.2)'; // semi-transparent blue
-      ctx.beginPath();
-      ctx.rect(bounds.x, bounds.y, bounds.width, bounds.height);
-      ctx.fill();
-      ctx.stroke();
-      ctx.restore();
+      renderSelectionBox(ctx, getSelectionBoxBounds(selectionBox));
     }
 
-  }, [strokes, currentStroke, selectionBox, renderStroke, color]);
+  }, [strokes, currentStroke, selectionBox, theme, tool, selectedStrokeIds, color]);
 
   useEffect(() => {
     render();
@@ -338,61 +193,89 @@ export const Blackboard = forwardRef<BlackboardRef, BlackboardProps>(({
   }, [render]);
 
 
-  // --- Input Handlers ---
+  // --- Event Handlers ---
 
   const handleStart = (e: React.MouseEvent | React.TouchEvent) => {
     const coords = getCoordinates(e);
     if (!coords) return;
 
-    if (tool === 'chalk' || tool === 'rect' || tool === 'circle' || tool === 'arrow') {
+    // 1. Drawing Tools
+    if (['chalk', 'rect', 'circle', 'arrow'].includes(tool)) {
       setIsDrawing(true);
       setCurrentStroke({
-        type: tool === 'chalk' ? 'freehand' : tool,
+        type: tool === 'chalk' ? 'freehand' : (tool as StrokeType),
         points: [coords],
         color: color,
         width: 4
       });
-      setSelectedStrokeIds(new Set()); // Clear selection when drawing
+      setSelectedStrokeIds(new Set()); 
+      return;
     } 
-    else if (tool === 'select') {
-      // Check if clicked on an EXISTING selected item -> Drag Mode
-      let clickedOnSelected = false;
+
+    // 2. Select Tool
+    if (tool === 'select') {
+      // A. Check for Handle Hits (only if 1 item selected)
+      if (selectedStrokeIds.size === 1) {
+        const id = Array.from(selectedStrokeIds)[0];
+        const stroke = strokes.find(s => s.id === id);
+        if (stroke) {
+          const handle = hitTestHandles(stroke, coords);
+          if (handle) {
+            setInteractionState({
+              type: handle === 'rot' ? 'rotate' : 'resize',
+              handle: handle,
+              startPos: coords,
+              initialStrokes: JSON.parse(JSON.stringify(strokes)) // Deep copy
+            });
+            // Update cursor immediately
+            setCursor(handle === 'rot' ? 'grabbing' : getCursorForHandle(handle, stroke.rotation));
+            return;
+          }
+        }
+      }
+
+      // B. Check for Stroke Hits (Dragging)
+      let clickedId: string | null = null;
       
-      // First check items already in selection set to prioritize dragging existing selection
+      // Prioritize currently selected
       for (const id of Array.from(selectedStrokeIds)) {
         const stroke = strokes.find(s => s.id === id);
         if (stroke && hitTestStroke(stroke, coords)) {
-          clickedOnSelected = true;
+          clickedId = id;
           break;
         }
       }
-
-      if (clickedOnSelected) {
-        setIsDraggingObjects(true);
-        setDragStartPos(coords);
-      } else {
-        // If not clicking a selected item, check if clicking ANY item
-        let foundId: string | null = null;
+      
+      // If not, check others (top to bottom z-index)
+      if (!clickedId) {
         for (let i = strokes.length - 1; i >= 0; i--) {
           if (hitTestStroke(strokes[i], coords)) {
-            foundId = strokes[i].id;
+            clickedId = strokes[i].id;
             break;
           }
         }
+      }
 
-        if (foundId) {
-          // Clicked on a new item -> Select only this item and start dragging
-          setSelectedStrokeIds(new Set([foundId]));
-          setIsDraggingObjects(true);
-          setDragStartPos(coords);
-        } else {
-          // Clicked on empty space -> Start Selection Box
-          // Clear current selection unless Shift key is handled (not implemented here)
-          setSelectedStrokeIds(new Set());
-          setSelectionBox({ start: coords, current: coords });
+      if (clickedId) {
+        if (!selectedStrokeIds.has(clickedId)) {
+          setSelectedStrokeIds(new Set([clickedId]));
         }
+        
+        setInteractionState({
+          type: 'drag',
+          startPos: coords,
+          initialStrokes: strokes 
+        });
+        setCursor('move');
+      } else {
+        // C. Start Selection Box
+        setSelectedStrokeIds(new Set());
+        setSelectionBox({ start: coords, current: coords });
+        setCursor('crosshair');
       }
     } 
+    
+    // 3. Eraser
     else if (tool === 'eraser') {
        setIsDrawing(true);
        const remaining = strokes.filter(s => !hitTestStroke(s, coords));
@@ -404,74 +287,200 @@ export const Blackboard = forwardRef<BlackboardRef, BlackboardProps>(({
     const coords = getCoordinates(e);
     if (!coords) return;
 
+    // --- Cursor Update Logic (When Idle) ---
+    if (interactionState.type === 'idle' && tool === 'select') {
+      let foundHandleCursor = false;
+      if (selectedStrokeIds.size === 1) {
+        const id = Array.from(selectedStrokeIds)[0];
+        const stroke = strokes.find(s => s.id === id);
+        if (stroke) {
+          const handle = hitTestHandles(stroke, coords);
+          if (handle) {
+             setCursor(getCursorForHandle(handle, stroke.rotation));
+             foundHandleCursor = true;
+          }
+        }
+      }
+      if (!foundHandleCursor) {
+        // Check if over a shape
+        let overShape = false;
+        // Prioritize selected
+        for (const id of Array.from(selectedStrokeIds)) {
+           if (strokes.find(s => s.id === id && hitTestStroke(s, coords))) { overShape = true; break; }
+        }
+        if (!overShape) {
+          for (const s of strokes) { if (hitTestStroke(s, coords)) { overShape = true; break; } }
+        }
+        setCursor(overShape ? 'move' : 'default');
+      }
+    }
+
+    // --- Interaction Logic ---
+
+    // Drawing
     if (isDrawing && currentStroke) {
       if (currentStroke.type === 'freehand') {
          setCurrentStroke(prev => ({ ...prev, points: [...(prev?.points || []), coords] }));
       } else {
         setCurrentStroke(prev => ({ ...prev, points: [prev!.points![0], coords] }));
       }
+      return;
     } 
-    else if (tool === 'select') {
-      if (isDraggingObjects && dragStartPos) {
-        const dx = coords.x - dragStartPos.x;
-        const dy = coords.y - dragStartPos.y;
+    
+    // Select / Transform Tool
+    if (tool === 'select') {
+      const { type, startPos, initialStrokes, handle } = interactionState;
+      
+      if (type === 'drag') {
+        const dx = coords.x - startPos.x;
+        const dy = coords.y - startPos.y;
 
-        // Move all selected strokes
         const newStrokes = strokes.map(s => {
           if (selectedStrokeIds.has(s.id)) {
             return { ...s, position: { x: s.position.x + dx, y: s.position.y + dy } };
           }
           return s;
         });
+        updateCurrentHistory(newStrokes);
+        setInteractionState(prev => ({ ...prev, startPos: coords })); // Reset start for next frame delta
+      } 
+      else if (type === 'rotate' && selectedStrokeIds.size === 1) {
+        const id = Array.from(selectedStrokeIds)[0];
+        const initialStroke = initialStrokes.find(s => s.id === id);
+        if (!initialStroke) return;
+
+        const bounds = getUnrotatedBounds(initialStroke);
+        const center = getCenter(bounds);
         
-        const newHistory = [...history];
-        newHistory[historyIndex] = newStrokes;
-        setHistory(newHistory);
-        setDragStartPos(coords);
-      } else if (selectionBox) {
-        // Update selection box
+        const startAngle = Math.atan2(startPos.y - center.y, startPos.x - center.x);
+        const currentAngle = Math.atan2(coords.y - center.y, coords.x - center.x);
+        const deltaRotation = currentAngle - startAngle;
+        
+        const newStrokes = strokes.map(s => {
+          if (s.id === id) {
+            return { ...s, rotation: initialStroke.rotation + deltaRotation };
+          }
+          return s;
+        });
+        updateCurrentHistory(newStrokes);
+      }
+      else if (type === 'resize' && selectedStrokeIds.size === 1) {
+        const id = Array.from(selectedStrokeIds)[0];
+        const initialStroke = initialStrokes.find(s => s.id === id);
+        if (!initialStroke) return;
+
+        // Local resize logic
+        const bounds = getUnrotatedBounds(initialStroke);
+        const center = getCenter(bounds);
+        
+        const localMouse = rotatePoint(coords, center, -initialStroke.rotation);
+        const localStart = rotatePoint(startPos, center, -initialStroke.rotation);
+        
+        const dx = localMouse.x - localStart.x;
+        const dy = localMouse.y - localStart.y;
+        
+        let newX = bounds.x;
+        let newY = bounds.y;
+        let newW = bounds.width;
+        let newH = bounds.height;
+
+        // Apply changes based on handle type
+        if (handle === 'se') {
+            newW += dx; newH += dy;
+        } else if (handle === 'sw') {
+            newX += dx; newW -= dx; newH += dy;
+        } else if (handle === 'ne') {
+            newY += dy; newH -= dy; newW += dx;
+        } else if (handle === 'nw') {
+            newX += dx; newY += dy; newW -= dx; newH -= dy;
+        } else if (handle === 'n') {
+            newY += dy; newH -= dy;
+        } else if (handle === 's') {
+            newH += dy;
+        } else if (handle === 'e') {
+            newW += dx;
+        } else if (handle === 'w') {
+            newX += dx; newW -= dx;
+        }
+        
+        if (newW < 10) newW = 10;
+        if (newH < 10) newH = 10;
+        
+        const newStrokes = strokes.map(s => {
+            if (s.id === id) {
+                if (s.type === 'rect' || s.type === 'circle') {
+                    return {
+                        ...s,
+                        position: { x: newX, y: newY },
+                        points: [{x: 0, y: 0}, {x: newW, y: newH}]
+                    };
+                } else if (s.type === 'arrow') {
+                    // Arrow scaling
+                    const scaleX = newW / bounds.width;
+                    const scaleY = newH / bounds.height;
+                    
+                     const scaledPoints = initialStroke.points.map(p => ({
+                         x: (p.x * scaleX), 
+                         y: (p.y * scaleY)
+                     }));
+                     
+                     return {
+                         ...s,
+                         position: { x: newX, y: newY }, 
+                         points: scaledPoints
+                     };
+                }
+            }
+            return s;
+        });
+        
+        updateCurrentHistory(newStrokes);
+      }
+      else if (selectionBox) {
         setSelectionBox(prev => prev ? { ...prev, current: coords } : null);
       }
     } 
+    
+    // Eraser
     else if (tool === 'eraser' && isDrawing) {
       const remaining = strokes.filter(s => !hitTestStroke(s, coords));
       if (remaining.length !== strokes.length) {
-         const newHistory = [...history];
-         newHistory[historyIndex] = remaining;
-         setHistory(newHistory);
+         updateCurrentHistory(remaining);
       }
     }
   };
 
   const handleEnd = () => {
+    // Finish Drawing
     if (isDrawing && currentStroke && currentStroke.points) {
       const pts = currentStroke.points;
       if (pts.length > 1 || (currentStroke.type === 'freehand' && pts.length > 0)) {
-        let minX = Infinity, minY = Infinity;
-        pts.forEach(p => { if (p.x < minX) minX = p.x; if (p.y < minY) minY = p.y; });
-
-        const normalizedPoints = pts.map(p => ({ x: p.x - minX, y: p.y - minY }));
+        const { points: normalizedPoints, offset } = normalizePoints(pts);
+        
         const newStroke: Stroke = {
           id: Date.now().toString() + Math.random().toString(),
           type: currentStroke.type as StrokeType,
           points: normalizedPoints,
           color: currentStroke.color || color,
           width: currentStroke.width || 4,
-          position: { x: minX, y: minY }
+          position: offset,
+          rotation: 0
         };
         pushToHistory([...strokes, newStroke]);
       }
       setCurrentStroke(null);
       setIsDrawing(false);
     } 
+    
+    // Finish Transform/Select
     else if (tool === 'select') {
-      if (isDraggingObjects) {
-        // Commit move
-        pushToHistory([...strokes]);
-        setIsDraggingObjects(false);
-        setDragStartPos(null);
-      } else if (selectionBox) {
-        // Finalize Selection Box
+      if (interactionState.type !== 'idle') {
+        if (interactionState.type !== 'drag' || interactionState.startPos) {
+           pushToHistory([...strokes]);
+        }
+        setInteractionState({ type: 'idle', startPos: {x:0,y:0}, initialStrokes: [] });
+      } 
+      else if (selectionBox) {
         const bounds = getSelectionBoxBounds(selectionBox);
         const newSelection = new Set<string>();
 
@@ -486,6 +495,8 @@ export const Blackboard = forwardRef<BlackboardRef, BlackboardProps>(({
         setSelectionBox(null);
       }
     } 
+    
+    // Finish Eraser
     else if (tool === 'eraser') {
       if (isDrawing) pushToHistory([...strokes]);
       setIsDrawing(false);
@@ -500,7 +511,7 @@ export const Blackboard = forwardRef<BlackboardRef, BlackboardProps>(({
         backgroundImage: theme === 'dark' 
           ? "url('https://www.transparenttextures.com/patterns/black-scales.png')"
           : "url('https://www.transparenttextures.com/patterns/clean-gray-paper.png')",
-        cursor: tool === 'select' ? 'default' : tool === 'eraser' ? 'not-allowed' : 'crosshair'
+        cursor: tool === 'select' ? cursor : tool === 'eraser' ? 'not-allowed' : 'crosshair'
       }}
     >
       <canvas

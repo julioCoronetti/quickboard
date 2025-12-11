@@ -19,19 +19,9 @@ interface ToolbarProps {
   canRedo: boolean;
 }
 
-const COLORS = [
-  '#ffffff', // White (adapts in logic)
-  '#ef4444', // Red
-  '#3b82f6', // Blue
-  '#22c55e', // Green
-  '#eab308', // Yellow
-];
-
 export const Toolbar: React.FC<ToolbarProps> = ({
   currentTool,
   setTool,
-  currentColor,
-  setColor,
   onClear,
   onUndo,
   onRedo,
@@ -98,23 +88,6 @@ export const Toolbar: React.FC<ToolbarProps> = ({
         <button onClick={() => setTool('eraser')} className={ButtonClass(currentTool === 'eraser')} title="Borracha">
           <Eraser size={18} />
         </button>
-      </div>
-
-      {/* Colors Group */}
-      <div className="flex gap-1.5 px-2 items-center">
-        {COLORS.map((c) => (
-          <button
-            key={c}
-            onClick={() => setColor(c)}
-            className={`w-5 h-5 rounded-full border border-gray-400/30 transition-transform ${
-              currentColor === c ? 'scale-125 ring-2 ring-blue-400 ring-offset-1 ring-offset-transparent' : 'hover:scale-110'
-            }`}
-            style={{ 
-              backgroundColor: c === '#ffffff' && !isDark ? '#000000' : c 
-            }}
-            title="Cor"
-          />
-        ))}
       </div>
 
       <div className="w-px h-8 bg-gray-600/30 mx-1" />

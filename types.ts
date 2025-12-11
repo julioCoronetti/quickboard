@@ -4,9 +4,18 @@ export type StrokeType = 'freehand' | 'rect' | 'circle' | 'arrow';
 
 export type Theme = 'dark' | 'light';
 
+export type ResizeHandle = 'nw' | 'ne' | 'sw' | 'se' | 'n' | 's' | 'e' | 'w' | 'rot';
+
 export interface Point {
   x: number;
   y: number;
+}
+
+export interface BoundingBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
 export interface Stroke {
@@ -16,6 +25,7 @@ export interface Stroke {
   color: string;
   width: number;
   position: Point; // Top-left coordinate for moving
+  rotation: number; // In radians
   isSelected?: boolean;
 }
 
