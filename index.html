@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Blackboard AI</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            cursor: {
+              'chalk': 'crosshair',
+              'move': 'move',
+              'eraser': 'not-allowed', // Fallback, usually custom cursor is better
+            },
+            backgroundImage: {
+              'chalkboard': "url('https://www.transparenttextures.com/patterns/black-scales.png'), linear-gradient(to bottom, #2c3e50, #000000)",
+            }
+          }
+        }
+      }
+    </script>
+    <style>
+      /* Prevent scrolling on mobile when touching canvas */
+      body {
+        overscroll-behavior: none;
+        touch-action: none;
+      }
+    </style>
+  <script type="importmap">
+{
+  "imports": {
+    "react/": "https://esm.sh/react@^19.2.1/",
+    "react": "https://esm.sh/react@^19.2.1",
+    "react-dom/": "https://esm.sh/react-dom@^19.2.1/",
+    "@google/genai": "https://esm.sh/@google/genai@^1.33.0",
+    "lucide-react": "https://esm.sh/lucide-react@^0.560.0"
+  }
+}
+</script>
+</head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

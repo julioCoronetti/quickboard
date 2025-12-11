@@ -1,0 +1,5 @@
+{
+  "name": "Blackboard AI",
+  "description": "Uma lousa digital interativa onde você pode desenhar, mover objetos, apagar e usar IA para analisar seus desenhos.",
+  "requestFramePermissions": []
+}
