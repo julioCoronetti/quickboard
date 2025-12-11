@@ -73,7 +73,7 @@ const App: React.FC = () => {
       {/* Header/Title */}
       <div className="absolute top-4 left-4 z-10 pointer-events-none select-none">
         <h1 className={`text-3xl font-bold opacity-50 tracking-widest font-serif ${theme === 'dark' ? 'text-gray-200' : 'text-gray-800'}`}>
-          Board.fun
+          Quickboard.fun
         </h1>
       </div>
 
